@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>🎹 Piano Log</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #D6EAFF; display: flex; justify-content: center; min-height: 100vh; }
+  #app { width: 100%; max-width: 430px; min-height: 100vh; position: relative; }
+  #loading { position: fixed; inset: 0; display: flex; flex-direction: column;
+             align-items: center; justify-content: center; z-index: 9999;
+             gap: 1rem; background: #042C53; color: #7EB3E8; font-size: 14px; }
+  .spinner { width: 36px; height: 36px; border: 3px solid rgba(126,179,232,0.3);
+             border-top-color: #7EB3E8; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  input, textarea, button { font-family: inherit; }
+  textarea { box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="loading">
+  <div class="spinner"></div>
+  <div>🎹 Piano Log 載入中…</div>
+</div>
+<div id="app"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script>
+// ══════════════════════════════════════════════════════════════
+// 設定（GitHub Actions 部署時自動替換佔位符）
+// ══════════════════════════════════════════════════════════════
+// Supabase — 資料存取（anon key 設計上可放前端，搭配 RLS 保護）
+const SUPABASE_URL      = "%%SUPABASE_URL%%";
+const SUPABASE_ANON_KEY = "%%SUPABASE_ANON_KEY%%";
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ══════════════════════════════════════════════════════════════
+// Supabase REST API 輔助函式
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * sb(method, table, opts)
+ * method : 'GET' | 'POST' | 'PATCH' | 'DELETE'
+ * table  : 'profiles' | 'pieces' | 'records'
+ * opts   :
+ *   eq      → { column: value } 等值篩選（可多個）
+ *   body    → 物件或陣列（POST/PATCH 的 payload）
+ *   select  → 欄位字串，預設 '*'
+ *   order   → 排序字串，如 'date.desc'
+ *   single  → true = 只回傳第一筆（而非陣列）
+ */
+async function sb(method, table, opts = {}) {
+  const { eq = {}, body, select = '*', order, single = false } = opts;
+
+  const params = new URLSearchParams({ select });
+  if (order) params.set('order', order);
+  Object.entries(eq).forEach(([k, v]) => params.set(k, `eq.${v}`));
+
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${params}`;
+
+  const headers = {
+    apikey:        SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+    'Content-Type': 'application/json',
+  };
+  // return=representation → POST/PATCH 回傳操作後的資料
+  if (method === 'POST' || method === 'PATCH') {
+    headers['Prefer'] = 'return=representation';
+  }
+
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body != null ? JSON.stringify(body) : undefined,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || `Supabase ${res.status} ${table}`);
+  }
+
+  const text = await res.text();
+  if (!text) return single ? null : [];
+  const data = JSON.parse(text);
+  return single ? (Array.isArray(data) ? data[0] || null : data) : data;
+}
+
+
+
+// ── 工具函式 ──────────────────────────────────────────────────
+function td() { return new Date().toISOString().split('T')[0]; }
+function newId() { return Date.now().toString(36) + Math.random().toString(36).substr(2, 6); }
+function wks(s, e) {
+  if (!s) return 0;
+  return Math.max(0, Math.floor((new Date(e || td()) - new Date(s)) / (7 * 86400 * 1000)));
+}
+// 只取 YYYY-MM-DD（Supabase date 欄位回傳已是正確格式，此為防護層）
+function fmtDate(s) { return (s || '').slice(0, 10) || '—'; }
+// 有效開始日期 = min(start_date, 所有記錄最早日期)
+function effectiveStart(startDate, recs) {
+  const base = fmtDate(startDate);
+  if (!recs || !recs.length) return base;
+  const earliest = recs.map(r => fmtDate(r.date)).filter(d => d && d !== '—').sort()[0];
+  return earliest && earliest < base ? earliest : base;
+}
+
+// ── 常數 ──────────────────────────────────────────────────────
+const NI = ['♩','♪','♫','♬'];
+const QB = [
+  ['♩','♩'],['♪','♪'],['♫','♫'],['♬','♬'],['=','='],
+  ['右','右手'],['左','左手'],['分手','分手'],['合手','合手'],
+  ['p.','p.'],['補速度','補速度'],['慢練','慢練'],['找音','找音'],['背譜','背譜'],['視奏','視奏'],
+];
+const AVATARS = ['🐱','🐶','🐰','🐻','🐼','🦊','🐸','🐨','🦄','🐧','🐬','🐙','🦋','🐯','🦖','🐳','🦜','🐝'];
+const BG_COLORS = ['#5B8FF9','#0F6E56','#9B59B6','#E74C6F','#E67E22','#16A085','#8E44AD','#C0392B','#2C3E50'];
+
+// ══════════════════════════════════════════════════════════════
+// UI 元件
+// ══════════════════════════════════════════════════════════════
+
+function QuickBar() {
+  function ins(v) {
+    const el = document.getElementById(window._fid || '');
+    if (!el) return;
+    const s = el.selectionStart ?? el.value.length;
+    const e = el.selectionEnd   ?? el.value.length;
+    const nv = el.value.slice(0, s) + v + el.value.slice(e);
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (setter) setter.set.call(el, nv);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.setSelectionRange(s + v.length, s + v.length);
+    el.focus();
+  }
+  return (
+    <div style={{background:'#fff',borderTop:'2px dashed #D6EAFF',padding:'0.6rem 0.8rem',flexShrink:0}}>
+      <div style={{fontSize:10,color:'#7EB3E8',marginBottom:'0.35rem'}}>✨ 快速插入 ── 先點練習內容欄，再點按鈕</div>
+      <div style={{display:'flex',flexWrap:'wrap',gap:'0.3rem'}}>
+        {QB.map(([l, v]) => (
+          <button key={l} onMouseDown={e => { e.preventDefault(); ins(v); }}
+            style={{background:'linear-gradient(135deg,#E8F4FF,#D6EAFF)',border:'1.5px solid #A8D0F5',
+                    color:'#2979C9',padding:'5px 10px',borderRadius:20,fontSize:12,cursor:'pointer',fontWeight:600}}>
+            {l}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Hdr({ title, sub, onBack, badge, accent = '#0C447C' }) {
+  return (
+    <div style={{background:`linear-gradient(135deg,${accent},#185FA5)`,padding:'0.9rem 1.1rem',
+                 display:'flex',alignItems:'center',gap:'0.5rem',flexShrink:0,
+                 boxShadow:'0 2px 8px rgba(12,68,124,0.25)'}}>
+      {onBack && <button onClick={onBack}
+        style={{background:'rgba(255,255,255,0.2)',border:'none',color:'#fff',fontSize:18,
+                cursor:'pointer',padding:'4px 8px',lineHeight:1,borderRadius:10}}>←</button>}
+      <div style={{flex:1,minWidth:0}}>
+        {sub && <div style={{color:'rgba(255,255,255,0.7)',fontSize:10,marginBottom:1}}>{sub}</div>}
+        <div style={{color:'#fff',fontSize:15,fontWeight:700,whiteSpace:'nowrap',
+                     overflow:'hidden',textOverflow:'ellipsis'}}>{title}</div>
+      </div>
+      {badge && <div style={{background:'rgba(255,255,255,0.25)',color:'#fff',fontSize:11,
+                             padding:'3px 10px',borderRadius:20,flexShrink:0,fontWeight:600}}>{badge}</div>}
+    </div>
+  );
+}
+
+function StatBar({ cols, bg = '#042C53' }) {
+  return (
+    <div style={{background:bg,padding:'0.6rem 1rem',display:'flex',flexShrink:0}}>
+      {cols.map((c, i) => (
+        <div key={i} style={{flex:1,textAlign:'center',borderRight:c.br?'1px dashed rgba(255,255,255,0.15)':'none'}}>
+          <div style={{color:c.lc||'#7EB3E8',fontSize:10,marginBottom:1}}>{c.l}</div>
+          <div style={{color:'#fff',fontSize:13,fontWeight:700}}>{c.v}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Toast({ msg, type }) {
+  if (!msg) return null;
+  return (
+    <div style={{position:'fixed',bottom:80,left:'50%',transform:'translateX(-50%)',
+                 background: type === 'error' ? '#FFEBEB' : '#E1F5EE',
+                 color: type === 'error' ? '#C0392B' : '#0F6E56',
+                 padding:'8px 18px',borderRadius:20,fontSize:12,fontWeight:600,
+                 zIndex:9999,whiteSpace:'nowrap',boxShadow:'0 2px 8px rgba(0,0,0,0.15)'}}>
+      {msg}
+    </div>
+  );
+}
+
+function EditRecordCard({ rec, onSave, onDelete }) {
+  const [editing, setEditing] = useState(false);
+  const [dt, setDt] = useState(fmtDate(rec.date));
+  const [no, setNo] = useState(rec.notes || '');
+  function save() { onSave({ ...rec, date: dt || rec.date, notes: no.trim() || rec.notes }); setEditing(false); }
+  function cancel() { setDt(fmtDate(rec.date)); setNo(rec.notes || ''); setEditing(false); }
+
+  if (editing) return (
+    <div style={{borderLeft:'4px solid #5B8FF9',padding:'0.65rem 0.8rem',marginBottom:'0.55rem',
+                 background:'linear-gradient(135deg,#EFF6FF,#E8F4FF)',borderRadius:'0 14px 14px 0'}}>
+      <div style={{marginBottom:'0.4rem'}}>
+        <div style={{fontSize:10,color:'#5B8FF9',marginBottom:2,fontWeight:600}}>📅 日期</div>
+        <input type="date" value={dt} onChange={e => setDt(e.target.value)}
+          style={{width:'100%',padding:'6px 8px',borderRadius:10,border:'1.5px solid #A8D0F5',
+                  fontSize:12,color:'#042C53',background:'#fff'}} />
+      </div>
+      <div style={{marginBottom:'0.5rem'}}>
+        <div style={{fontSize:10,color:'#5B8FF9',marginBottom:2,fontWeight:600}}>🎵 練習內容</div>
+        <textarea id={'edit-' + rec.record_id} value={no} onChange={e => setNo(e.target.value)}
+          onFocus={() => { window._fid = 'edit-' + rec.record_id; }} rows={2}
+          style={{width:'100%',padding:'6px 8px',borderRadius:10,border:'1.5px solid #A8D0F5',
+                  fontSize:13,color:'#042C53',background:'#fff',resize:'none'}} />
+      </div>
+      <QuickBar />
+      <div style={{display:'flex',gap:'0.4rem',marginTop:'0.4rem'}}>
+        <button onClick={save} style={{flex:1,background:'linear-gradient(135deg,#5B8FF9,#2979C9)',
+          color:'#fff',border:'none',padding:'8px',borderRadius:10,fontSize:12,cursor:'pointer',fontWeight:700}}>✓ 儲存</button>
+        <button onClick={cancel} style={{flex:1,background:'#E8F4FF',color:'#5B8FF9',
+          border:'1.5px solid #A8D0F5',padding:'8px',borderRadius:10,fontSize:12,cursor:'pointer'}}>取消</button>
+        <button onClick={() => onDelete(rec.record_id)}
+          style={{background:'#FFEBEB',color:'#C0392B',border:'1.5px solid #F5B8B8',
+                  padding:'8px 12px',borderRadius:10,fontSize:12,cursor:'pointer'}}>🗑</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div onClick={() => setEditing(true)}
+      style={{borderLeft:'4px solid #5B8FF9',padding:'0.55rem 0.8rem',marginBottom:'0.5rem',
+              background:'#fff',borderRadius:'0 14px 14px 0',boxShadow:'0 1px 4px rgba(91,143,249,0.1)',
+              cursor:'pointer',display:'flex',alignItems:'flex-start',gap:'0.5rem'}}
+      onMouseOver={e => e.currentTarget.style.background = '#EFF6FF'}
+      onMouseOut={e => e.currentTarget.style.background = '#fff'}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:10,color:'#5B8FF9',marginBottom:2,fontWeight:600}}>{fmtDate(rec.date)}</div>
+        <div style={{fontSize:13,color:'#1a2e4a',fontWeight:500}}>{rec.notes}</div>
+      </div>
+      <div style={{color:'#A8D0F5',fontSize:13,flexShrink:0,marginTop:2}}>✎</div>
+    </div>
+  );
+}
+
+function ReadRecordCard({ rec }) {
+  return (
+    <div style={{borderLeft:'4px solid #52C898',padding:'0.55rem 0.8rem',marginBottom:'0.5rem',
+                 background:'#fff',borderRadius:'0 14px 14px 0',boxShadow:'0 1px 4px rgba(82,200,152,0.1)'}}>
+      <div style={{fontSize:10,color:'#52C898',marginBottom:2,fontWeight:600}}>{fmtDate(rec.date)}</div>
+      <div style={{fontSize:13,color:'#1a2e4a',fontWeight:500}}>{rec.notes}</div>
+    </div>
+  );
+}
+
+function PassModal({ piece, onConfirm, onCancel }) {
+  const [passDt, setPassDt] = useState(td());
+  const w = wks(fmtDate(piece.effStart || piece.start_date), passDt);
+  function yesterday() { const d = new Date(); d.setDate(d.getDate()-1); return d.toISOString().split('T')[0]; }
+  function lastWeekday(day) {
+    const d = new Date(); const diff = ((d.getDay()-day+7)%7)||7; d.setDate(d.getDate()-diff);
+    return d.toISOString().split('T')[0];
+  }
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(4,44,83,0.6)',display:'flex',
+                 alignItems:'center',justifyContent:'center',zIndex:999,padding:'1.5rem'}}>
+      <div style={{background:'#fff',borderRadius:22,width:'100%',maxWidth:340,
+                   overflow:'hidden',boxShadow:'0 8px 32px rgba(4,44,83,0.35)'}}>
+        <div style={{background:'linear-gradient(135deg,#52C898,#0F6E56)',padding:'1rem 1.2rem',textAlign:'center'}}>
+          <div style={{fontSize:32,marginBottom:'0.25rem'}}>🏆</div>
+          <div style={{color:'#fff',fontSize:16,fontWeight:700}}>標記為過關</div>
+          <div style={{color:'rgba(255,255,255,0.8)',fontSize:12,marginTop:2}}>{piece.name}</div>
+        </div>
+        <div style={{padding:'1.2rem'}}>
+          <div style={{background:'linear-gradient(135deg,#E1F5EE,#D4F5E7)',borderRadius:14,
+                       padding:'0.9rem',marginBottom:'1rem',border:'1.5px solid #9FE1CB'}}>
+            <div style={{fontSize:11,color:'#0F6E56',fontWeight:700,marginBottom:6}}>📅 過關日期</div>
+            <input type="date" value={passDt} onChange={e => setPassDt(e.target.value)}
+              style={{width:'100%',padding:'9px 10px',borderRadius:10,border:'1.5px solid #9FE1CB',
+                      fontSize:14,color:'#1a2e4a',background:'#fff',fontWeight:600}} />
+            <div style={{fontSize:11,color:'#52C898',marginTop:6,textAlign:'center'}}>
+              🗓 從 {fmtDate(piece.effStart || piece.start_date)} 開始，共練了 <strong>{w} 週</strong>
+            </div>
+          </div>
+          <div style={{fontSize:10,color:'#7EB3E8',marginBottom:6,fontWeight:600}}>⚡ 快速選擇</div>
+          <div style={{display:'flex',gap:'0.4rem',marginBottom:'1rem',flexWrap:'wrap'}}>
+            {[{l:'今天',v:td()},{l:'昨天',v:yesterday()},{l:'上週六',v:lastWeekday(6)},{l:'上週日',v:lastWeekday(0)}].map(opt => (
+              <button key={opt.l} onClick={() => setPassDt(opt.v)}
+                style={{background: passDt===opt.v ? 'linear-gradient(135deg,#52C898,#0F6E56)' : '#E1F5EE',
+                        color: passDt===opt.v ? '#fff' : '#0F6E56',
+                        border:'1.5px solid #9FE1CB',padding:'5px 11px',borderRadius:20,
+                        fontSize:12,cursor:'pointer',fontWeight:600}}>
+                {opt.l}
+              </button>
+            ))}
+          </div>
+          <div style={{display:'flex',gap:'0.5rem'}}>
+            <button onClick={onCancel}
+              style={{flex:1,background:'#F0F7FF',color:'#5B8FF9',border:'1.5px solid #A8D0F5',
+                      padding:'11px',borderRadius:12,fontSize:13,cursor:'pointer',fontWeight:600}}>取消</button>
+            <button onClick={() => onConfirm(passDt)}
+              style={{flex:2,background:'linear-gradient(135deg,#52C898,#0F6E56)',color:'#fff',border:'none',
+                      padding:'11px',borderRadius:12,fontSize:13,cursor:'pointer',fontWeight:700,
+                      boxShadow:'0 3px 10px rgba(15,110,86,0.35)'}}>🏆 確認過關！</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ══════════════════════════════════════════════════════════════
+// Main App
+// ══════════════════════════════════════════════════════════════
+function App() {
+  const [profiles,       setProfiles]       = useState([]);
+  const [sc,             setSc]             = useState('profile');
+  const [pid,            setPid]            = useState(null);
+  const [pieces,         setPieces]         = useState([]);
+  const [records,        setRecords]        = useState({});
+  const [sel,            setSel]            = useState(null);
+  const [hsel,           setHsel]           = useState(null);
+  const [hback,          setHback]          = useState('home');
+  const [htab,           setHtab]           = useState('cur');
+  const [hsearch,        setHsearch]        = useState('');
+  const [passTarget,     setPassTarget]     = useState(null);
+  const [toast,          setToast]          = useState({ msg:'', type:'info' });
+  const [busy,           setBusy]           = useState(false);
+  const [editingProfile, setEditingProfile] = useState(null);
+  const [epName,         setEpName]         = useState('');
+  const [epAvatar,       setEpAvatar]       = useState('🐱');
+  const [epBg,           setEpBg]           = useState('#5B8FF9');
+  const [addFrom,        setAddFrom]        = useState(null);
+  const [addDt,          setAddDt]          = useState(td());
+  const [addNo,          setAddNo]          = useState('');
+  const [rows,           setRows]           = useState([{ id:0, piece:'', notes:'' }]);
+  const [multDt,         setMultDt]         = useState(td());
+
+  function showToast(msg, type='info') {
+    setToast({ msg, type });
+    setTimeout(() => setToast({ msg:'', type:'info' }), 3000);
+  }
+
+  // ── 初始載入 ──────────────────────────────────────────────
+  useEffect(() => {
+    sb('GET', 'profiles', { order: 'created_at.asc' })
+      .then(data => {
+        setProfiles(data || []);
+        const ld = document.getElementById('loading');
+        if (ld) ld.style.display = 'none';
+      })
+      .catch(err => {
+        showToast('載入失敗：' + err.message, 'error');
+        const ld = document.getElementById('loading');
+        if (ld) ld.style.display = 'none';
+      });
+  }, []);
+
+  // ── 切換帳號時載入曲目 ────────────────────────────────────
+  useEffect(() => {
+    if (!pid) return;
+    sb('GET', 'pieces', { eq:{ profile_id: pid }, order:'created_at.asc' })
+      .then(setPieces).catch(err => showToast(err.message, 'error'));
+  }, [pid]);
+
+  async function loadRecords(piece_id) {
+    if (records[piece_id]) return;
+    try {
+      const recs = await sb('GET', 'records', { eq:{ piece_id }, order:'date.desc' });
+      setRecords(prev => ({ ...prev, [piece_id]: recs || [] }));
+    } catch (err) { showToast(err.message, 'error'); }
+  }
+
+  function go(screen, opts = {}) {
+    if (opts.pid    !== undefined) setPid(opts.pid);
+    if (opts.sel    !== undefined) { setSel(opts.sel);   if (opts.sel)  loadRecords(opts.sel); }
+    if (opts.hsel   !== undefined) { setHsel(opts.hsel); if (opts.hsel) loadRecords(opts.hsel); }
+    if (opts.hback  !== undefined) setHback(opts.hback);
+    if (opts.htab   !== undefined) setHtab(opts.htab);
+    if (opts.hsearch !== undefined) setHsearch(opts.hsearch);
+    if (opts.addFrom !== undefined) { setAddFrom(opts.addFrom); setAddDt(td()); setAddNo(''); }
+    if (opts.addFrom === undefined && screen === 'add') {
+      setAddFrom(null); setRows([{ id:0, piece:'', notes:'' }]); setMultDt(td());
+    }
+    setSc(screen);
+  }
+
+  const D_cur      = pieces.filter(p => p.status === 'cur');
+  const D_hist     = pieces.filter(p => p.status === 'hist');
+  const curPiece   = pieces.find(p => p.piece_id === sel);
+  const histPiece  = pieces.find(p => p.piece_id === hsel);
+  function pieceRecs(id) { return (records[id] || []).sort((a,b) => b.date.localeCompare(a.date)); }
+
+  // ── 資料操作（全部改用 Supabase）─────────────────────────
+
+  async function doSaveRecord(pieceId, recData) {
+    setBusy(true);
+    try {
+      if (recData.record_id) {
+        // 更新現有記錄
+        await sb('PATCH', 'records', {
+          eq: { record_id: recData.record_id },
+          body: { date: recData.date, notes: recData.notes },
+        });
+      } else {
+        // 新增記錄
+        const res = await sb('POST', 'records', {
+          body: { record_id: newId(), piece_id: pieceId, date: recData.date, notes: recData.notes },
+        });
+        recData.record_id = res?.[0]?.record_id || recData.record_id;
+      }
+      setRecords(prev => {
+        const list = (prev[pieceId] || []).filter(r => r.record_id !== recData.record_id);
+        return { ...prev, [pieceId]: [recData, ...list].sort((a,b) => b.date.localeCompare(a.date)) };
+      });
+      showToast('✓ 已儲存');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  async function doDeleteRecord(pieceId, record_id) {
+    setBusy(true);
+    try {
+      await sb('DELETE', 'records', { eq:{ record_id } });
+      setRecords(prev => ({ ...prev, [pieceId]: (prev[pieceId]||[]).filter(r=>r.record_id!==record_id) }));
+      showToast('已刪除');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  async function doPass(piece, passDate) {
+    setBusy(true);
+    try {
+      await sb('PATCH', 'pieces', {
+        eq: { piece_id: piece.piece_id },
+        body: { status: 'hist', pass_date: passDate },
+      });
+      setPieces(prev => prev.map(p =>
+        p.piece_id === piece.piece_id ? { ...p, status:'hist', pass_date: passDate } : p
+      ));
+      setPassTarget(null);
+      go('home', { htab:'hist' });
+      showToast('🏆 ' + piece.name + ' 過關！');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  async function doSaveSingle() {
+    if (!addFrom || !addNo.trim()) return;
+    setBusy(true);
+    try {
+      const rec_id = newId();
+      await sb('POST', 'records', {
+        body: { record_id: rec_id, piece_id: addFrom, date: addDt||td(), notes: addNo.trim() },
+      });
+      const rec = { record_id: rec_id, piece_id: addFrom, date: addDt||td(), notes: addNo.trim() };
+      setRecords(prev => ({
+        ...prev,
+        [addFrom]: [rec, ...(prev[addFrom]||[])].sort((a,b) => b.date.localeCompare(a.date)),
+      }));
+      showToast('✓ 已新增');
+      go('detail', { sel: addFrom });
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  // ✅ 批次儲存：Supabase 原生支援陣列 POST（bulk insert）
+  async function doSaveAll() {
+    const valid = rows.filter(r => r.piece.trim());
+    if (!valid.length) return;
+    setBusy(true);
+    try {
+      const dt = multDt || td();
+      const newRecords = [];
+
+      for (const row of valid) {
+        // 找現有曲目（記憶體中查找，不重複呼叫 API）
+        let piece = D_cur.find(p => p.name.toLowerCase() === row.piece.trim().toLowerCase());
+        let piece_id;
+
+        if (!piece) {
+          // 新曲目：POST 建立
+          const pid2  = newId();
+          const saved = await sb('POST', 'pieces', {
+            body: { piece_id: pid2, profile_id: pid, name: row.piece.trim(), start_date: dt, status:'cur' },
+          });
+          piece_id = saved?.[0]?.piece_id || pid2;
+          const newPiece = { piece_id, profile_id: pid, name: row.piece.trim(), start_date: dt, status:'cur', pass_date: null };
+          setPieces(prev => [...prev, newPiece]);
+        } else {
+          piece_id = piece.piece_id;
+        }
+
+        newRecords.push({ record_id: newId(), piece_id, date: dt, notes: row.notes.trim() || '練習' });
+      }
+
+      // 一次批次 POST 所有記錄（Supabase 支援 array body = bulk insert）
+      if (newRecords.length) {
+        await sb('POST', 'records', { body: newRecords });
+        newRecords.forEach(rec => {
+          setRecords(prev => ({
+            ...prev,
+            [rec.piece_id]: [rec, ...(prev[rec.piece_id]||[])].sort((a,b) => b.date.localeCompare(a.date)),
+          }));
+        });
+      }
+
+      showToast('✓ 所有記錄已儲存');
+      go('home');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  async function doSaveProfile() {
+    if (!epName.trim()) return;
+    setBusy(true);
+    try {
+      if (editingProfile === 'new') {
+        const pid2 = newId();
+        const res  = await sb('POST', 'profiles', {
+          body: { profile_id: pid2, name: epName.trim(), avatar: epAvatar, bg_color: epBg },
+        });
+        const newP = res?.[0] || { profile_id: pid2, name: epName.trim(), avatar: epAvatar, bg_color: epBg };
+        setProfiles(prev => [...prev, newP]);
+      } else {
+        await sb('PATCH', 'profiles', {
+          eq:   { profile_id: editingProfile.profile_id },
+          body: { name: epName.trim(), avatar: epAvatar, bg_color: epBg },
+        });
+        setProfiles(prev => prev.map(p =>
+          p.profile_id === editingProfile.profile_id
+            ? { ...p, name: epName.trim(), avatar: epAvatar, bg_color: epBg } : p
+        ));
+      }
+      setEditingProfile(null);
+      showToast('✓ 帳號已儲存');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  async function doDeleteProfile(profile_id) {
+    if (!confirm('確定要刪除這個帳號及所有練習記錄？')) return;
+    setBusy(true);
+    try {
+      // Supabase FK CASCADE 自動刪除關聯的 pieces 和 records
+      await sb('DELETE', 'profiles', { eq:{ profile_id } });
+      setProfiles(prev => prev.filter(p => p.profile_id !== profile_id));
+      setEditingProfile(null);
+      showToast('帳號已刪除');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  // ── Shell ─────────────────────────────────────────────────
+  function shell(children) {
+    return (
+      <div style={{display:'flex',flexDirection:'column',minHeight:'100vh',
+                   background:'linear-gradient(160deg,#E8F4FF 0%,#D6EAFF 100%)',position:'relative'}}>
+        {children}
+        {passTarget && <PassModal piece={passTarget}
+          onConfirm={d => doPass(passTarget, d)} onCancel={() => setPassTarget(null)} />}
+        <Toast msg={toast.msg} type={toast.type} />
+        {busy && <div style={{position:'fixed',top:0,left:0,right:0,height:3,
+                              background:'linear-gradient(90deg,#5B8FF9,#52C898)',zIndex:9999}} />}
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // PROFILE EDIT
+  // ══════════════════════════════════════════════════════════
+  if (editingProfile !== null) return shell(<>
+    <Hdr title={editingProfile==='new' ? '✨ 新增帳號' : '✏️ 編輯帳號'} onBack={() => setEditingProfile(null)} />
+    <div style={{flex:1,overflowY:'auto',padding:'1rem'}}>
+      <div style={{textAlign:'center',marginBottom:'1.2rem'}}>
+        <div style={{width:80,height:80,borderRadius:'50%',background:epBg,display:'inline-flex',
+                     alignItems:'center',justifyContent:'center',fontSize:40,
+                     boxShadow:'0 4px 16px rgba(0,0,0,0.2)',border:'3px solid #fff',marginBottom:'0.4rem'}}>{epAvatar}</div>
+        <div style={{color:'#185FA5',fontWeight:700,fontSize:15}}>{epName || '帳號名稱'}</div>
+      </div>
+      {[
+        { label:'👤 帳號名稱', content:
+          <input value={epName} onChange={e => setEpName(e.target.value)} placeholder="例：Lily、媽媽、小明"
+            style={{width:'100%',padding:'9px 10px',borderRadius:10,border:'1.5px solid #A8D0F5',fontSize:14,color:'#1a2e4a'}} /> },
+        { label:'🐾 選擇頭像', content:
+          <div style={{display:'flex',flexWrap:'wrap',gap:'0.5rem'}}>
+            {AVATARS.map(a => (
+              <button key={a} onClick={() => setEpAvatar(a)}
+                style={{width:46,height:46,borderRadius:'50%',
+                        background: epAvatar===a ? epBg : '#F0F7FF',
+                        border: epAvatar===a ? `3px solid ${epBg}` : '2px solid #D6EAFF',
+                        fontSize:22,cursor:'pointer',boxShadow:epAvatar===a?'0 2px 8px rgba(0,0,0,0.2)':'none'}}>
+                {a}
+              </button>
+            ))}
+          </div> },
+        { label:'🎨 背景顏色', content:
+          <div style={{display:'flex',flexWrap:'wrap',gap:'0.5rem'}}>
+            {BG_COLORS.map(c => (
+              <button key={c} onClick={() => setEpBg(c)}
+                style={{width:36,height:36,borderRadius:'50%',background:c,cursor:'pointer',
+                        border: epBg===c ? '3px solid #fff' : '2px solid transparent',
+                        boxShadow: epBg===c ? `0 0 0 2px ${c},0 2px 8px rgba(0,0,0,0.3)` : '0 1px 3px rgba(0,0,0,0.2)'}}/> ))}
+          </div> },
+      ].map(({ label, content }) => (
+        <div key={label} style={{background:'#fff',borderRadius:16,padding:'0.9rem',marginBottom:'0.7rem',
+                                 boxShadow:'0 2px 8px rgba(91,143,249,0.1)'}}>
+          <div style={{fontSize:11,color:'#5B8FF9',fontWeight:700,marginBottom:8}}>{label}</div>
+          {content}
+        </div>
+      ))}
+      <button onClick={doSaveProfile}
+        style={{width:'100%',background:'linear-gradient(135deg,#5B8FF9,#2979C9)',color:'#fff',border:'none',
+                padding:'12px',borderRadius:14,fontSize:14,cursor:'pointer',fontWeight:700,
+                boxShadow:'0 4px 12px rgba(41,121,201,0.35)',marginBottom:'0.5rem'}}>✓ 儲存帳號</button>
+      {editingProfile !== 'new' && (
+        <button onClick={() => doDeleteProfile(editingProfile.profile_id)}
+          style={{width:'100%',background:'#FFF0F0',color:'#C0392B',border:'1.5px solid #F5B8B8',
+                  padding:'10px',borderRadius:14,fontSize:13,cursor:'pointer',fontWeight:600}}>🗑 刪除此帳號</button>
+      )}
+    </div>
+  </>);
+
+  // ══════════════════════════════════════════════════════════
+  // PROFILE SELECT
+  // ══════════════════════════════════════════════════════════
+  if (sc === 'profile') return shell(
+    <div style={{display:'flex',flexDirection:'column',minHeight:'100vh',
+                 background:'linear-gradient(160deg,#042C53 0%,#0C447C 60%,#185FA5 100%)'}}>
+      <div style={{textAlign:'center',paddingTop:'2.5rem',fontSize:28,letterSpacing:12,color:'rgba(183,210,244,0.4)'}}>♩♪♫♬</div>
+      <div style={{textAlign:'center',marginTop:'0.5rem'}}>
+        <div style={{color:'#E6F1FB',fontSize:28,fontWeight:700,letterSpacing:1}}>Piano Log</div>
+        <div style={{color:'#5B8FF9',fontSize:13,marginTop:4}}>🎹 家庭鋼琴練習日誌</div>
+      </div>
+      <div style={{fontSize:11,color:'rgba(255,255,255,0.3)',textAlign:'center',marginTop:'0.5rem'}}>✨ 選擇帳號開始練習</div>
+      <div style={{flex:1,display:'flex',flexWrap:'wrap',alignItems:'flex-start',
+                   justifyContent:'center',gap:'1.5rem',padding:'1.5rem'}}>
+        {profiles.map(p => (
+          <div key={p.profile_id} style={{display:'flex',flexDirection:'column',alignItems:'center',gap:'0.55rem'}}>
+            <div style={{position:'relative'}}>
+              <div onClick={() => go('home',{pid:p.profile_id,htab:'cur'})}
+                style={{width:80,height:80,borderRadius:'50%',background:p.bg_color,display:'flex',
+                        alignItems:'center',justifyContent:'center',fontSize:40,
+                        boxShadow:'0 4px 20px rgba(0,0,0,0.35)',border:'3px solid rgba(255,255,255,0.3)',cursor:'pointer'}}
+                onMouseOver={e=>e.currentTarget.style.transform='scale(1.08)'}
+                onMouseOut={e=>e.currentTarget.style.transform='scale(1)'}>{p.avatar}</div>
+              <button onClick={()=>{setEpName(p.name);setEpAvatar(p.avatar);setEpBg(p.bg_color);setEditingProfile(p);}}
+                style={{position:'absolute',top:-2,right:-2,width:24,height:24,borderRadius:'50%',
+                        background:'rgba(255,255,255,0.95)',border:'none',fontSize:12,cursor:'pointer',
+                        display:'flex',alignItems:'center',justifyContent:'center',
+                        boxShadow:'0 1px 4px rgba(0,0,0,0.25)'}}>✎</button>
+            </div>
+            <div style={{color:'#E6F1FB',fontSize:13,fontWeight:600}}>{p.name}</div>
+          </div>
+        ))}
+        <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:'0.55rem'}}>
+          <button onClick={()=>{setEpName('');setEpAvatar('🐱');setEpBg('#5B8FF9');setEditingProfile('new');}}
+            style={{width:80,height:80,borderRadius:'50%',background:'rgba(255,255,255,0.12)',
+                    border:'2.5px dashed rgba(183,210,244,0.5)',display:'flex',alignItems:'center',
+                    justifyContent:'center',fontSize:32,cursor:'pointer',color:'rgba(183,210,244,0.7)'}}
+            onMouseOver={e=>e.currentTarget.style.background='rgba(255,255,255,0.2)'}
+            onMouseOut={e=>e.currentTarget.style.background='rgba(255,255,255,0.12)'}>＋</button>
+          <div style={{color:'rgba(183,210,244,0.6)',fontSize:12}}>新增帳號</div>
+        </div>
+      </div>
+      <div style={{padding:'1rem',textAlign:'center',color:'rgba(255,255,255,0.15)',fontSize:10}}>♪ Piano Log · 家庭練琴日誌</div>
+    </div>
+  );
+
+  // ══════════════════════════════════════════════════════════
+  // HOME
+  // ══════════════════════════════════════════════════════════
+  if (sc === 'home') {
+    const pr = profiles.find(p => p.profile_id === pid) || {};
+    const filtered = D_hist.filter(p => !hsearch || p.name.toLowerCase().includes(hsearch.toLowerCase()));
+    return shell(<>
+      <div style={{background:`linear-gradient(135deg,#0C447C,${pr.bg_color||'#185FA5'})`,
+                   padding:'0.9rem 1.1rem',display:'flex',alignItems:'center',
+                   justifyContent:'space-between',flexShrink:0,boxShadow:'0 2px 8px rgba(12,68,124,0.25)'}}>
+        <div style={{display:'flex',alignItems:'center',gap:'0.6rem'}}>
+          <div style={{width:38,height:38,borderRadius:'50%',background:pr.bg_color,display:'flex',
+                       alignItems:'center',justifyContent:'center',fontSize:22,
+                       border:'2px solid rgba(255,255,255,0.4)'}}>{pr.avatar}</div>
+          <div>
+            <div style={{color:'rgba(255,255,255,0.6)',fontSize:10}}>♫ Piano Log</div>
+            <div style={{color:'#fff',fontSize:15,fontWeight:700}}>{pr.name} 的練習日誌</div>
+          </div>
+        </div>
+        <button onClick={()=>go('profile')}
+          style={{background:'rgba(255,255,255,0.2)',border:'none',color:'#fff',
+                  padding:'5px 12px',borderRadius:20,fontSize:11,cursor:'pointer',fontWeight:600}}>切換 ›</button>
+      </div>
+      <div style={{display:'flex',background:'#042C53',flexShrink:0}}>
+        {['cur','hist'].map(t => (
+          <button key={t} onClick={()=>{setHtab(t);setHsearch('');}}
+            style={{flex:1,padding:'0.55rem',border:'none',
+                    background:htab===t?'rgba(91,143,249,0.2)':'transparent',
+                    color:htab===t?'#7EB3E8':'rgba(126,179,232,0.5)',
+                    fontSize:12,cursor:'pointer',fontWeight:htab===t?700:400,
+                    borderBottom:`2.5px solid ${htab===t?'#5B8FF9':'transparent'}`}}>
+            {t==='cur'?`🎵 練習中 (${D_cur.length})`:`🏆 已過關 (${D_hist.length})`}
+          </button>
+        ))}
+      </div>
+      {htab === 'cur' ? (
+        <div style={{flex:1,padding:'0.85rem',overflowY:'auto'}}>
+          {D_cur.length===0 && <div style={{textAlign:'center',padding:'3rem',color:'#A8D0F5',fontSize:13}}>♪ 目前沒有練習中的曲目～</div>}
+          {D_cur.map((p,i) => (
+            <div key={p.piece_id} onClick={()=>go('detail',{sel:p.piece_id})}
+              style={{background:'#fff',borderRadius:18,padding:'0.9rem 1rem',marginBottom:'0.6rem',
+                      boxShadow:'0 2px 8px rgba(91,143,249,0.12)',cursor:'pointer',
+                      display:'flex',alignItems:'center',gap:'0.7rem',border:'1.5px solid #E8F4FF'}}
+              onMouseOver={e=>e.currentTarget.style.boxShadow='0 4px 14px rgba(91,143,249,0.22)'}
+              onMouseOut={e=>e.currentTarget.style.boxShadow='0 2px 8px rgba(91,143,249,0.12)'}>
+              <div style={{width:42,height:42,borderRadius:'50%',background:'linear-gradient(135deg,#E8F4FF,#D6EAFF)',
+                           display:'flex',alignItems:'center',justifyContent:'center',fontSize:20,
+                           flexShrink:0,border:'1.5px solid #A8D0F5'}}>{NI[i%4]}</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:14,fontWeight:700,color:'#1a2e4a',whiteSpace:'nowrap',
+                             overflow:'hidden',textOverflow:'ellipsis'}}>{p.name}</div>
+                <div style={{fontSize:11,color:'#5B8FF9',marginTop:2}}>
+                  {pieceRecs(p.piece_id)[0] ? `${fmtDate(pieceRecs(p.piece_id)[0].date)} · ${pieceRecs(p.piece_id)[0].notes}` : '尚未記錄'}
+                </div>
+              </div>
+              <div style={{textAlign:'right',flexShrink:0}}>
+                <div style={{fontSize:10,color:'#A8D0F5',background:'#EFF6FF',padding:'2px 7px',borderRadius:10,marginBottom:2}}>
+                  已練 {wks(effectiveStart(p.start_date, records[p.piece_id]))} 週
+                </div>
+                <div style={{color:'#A8D0F5',fontSize:16}}>›</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (<>
+        <div style={{padding:'0.6rem 0.85rem 0.45rem',background:'rgba(255,255,255,0.85)',
+                     borderBottom:'1.5px dashed #D6EAFF',flexShrink:0}}>
+          <input type="text" value={hsearch} placeholder="🔍 搜尋曲目名稱…" onChange={e=>setHsearch(e.target.value)}
+            style={{width:'100%',padding:'9px 12px',borderRadius:12,border:'1.5px solid #A8D0F5',
+                    fontSize:13,background:'#fff',color:'#1a2e4a'}} />
+        </div>
+        <div style={{flex:1,padding:'0.85rem',overflowY:'auto'}}>
+          {filtered.length===0 && <div style={{textAlign:'center',padding:'3rem',color:'#A8D0F5',fontSize:13}}>
+            🏆 {hsearch?'找不到符合的曲目':'還沒有過關的曲目～'}
+          </div>}
+          {filtered.map(p => (
+            <div key={p.piece_id} onClick={()=>go('histdetail',{hsel:p.piece_id,hback:'home'})}
+              style={{background:'#fff',borderRadius:18,padding:'0.9rem 1rem',marginBottom:'0.6rem',
+                      boxShadow:'0 2px 8px rgba(82,200,152,0.12)',cursor:'pointer',
+                      display:'flex',alignItems:'center',gap:'0.7rem',border:'1.5px solid #D4F5E7'}}
+              onMouseOver={e=>e.currentTarget.style.boxShadow='0 4px 14px rgba(82,200,152,0.22)'}
+              onMouseOut={e=>e.currentTarget.style.boxShadow='0 2px 8px rgba(82,200,152,0.12)'}>
+              <div style={{width:42,height:42,borderRadius:'50%',background:'linear-gradient(135deg,#E1F5EE,#C8EDDC)',
+                           display:'flex',alignItems:'center',justifyContent:'center',fontSize:20,
+                           flexShrink:0,border:'1.5px solid #9FE1CB'}}>🏆</div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:14,fontWeight:700,color:'#1a2e4a',whiteSpace:'nowrap',
+                             overflow:'hidden',textOverflow:'ellipsis'}}>{p.name}</div>
+                <div style={{fontSize:11,color:'#52C898',marginTop:2}}>
+                  過關：{fmtDate(p.pass_date)} · {wks(fmtDate(p.start_date), fmtDate(p.pass_date))} 週 · {(records[p.piece_id]||[]).length} 次
+                </div>
+              </div>
+              <div style={{color:'#9FE1CB',fontSize:18}}>›</div>
+            </div>
+          ))}
+        </div>
+      </>)}
+      <div style={{background:'rgba(4,44,83,0.95)',padding:'0.6rem 1rem',
+                   display:'flex',justifyContent:'flex-end',alignItems:'center',flexShrink:0}}>
+
+        <button onClick={()=>go('add',{addFrom:undefined})}
+          style={{background:'linear-gradient(135deg,#5B8FF9,#2979C9)',border:'none',color:'#fff',
+                  padding:'9px 22px',borderRadius:22,fontSize:13,cursor:'pointer',fontWeight:700,
+                  boxShadow:'0 3px 10px rgba(41,121,201,0.4)'}}>🎵 新增記錄</button>
+      </div>
+    </>);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // DETAIL（練習中）
+  // ══════════════════════════════════════════════════════════
+  if (sc === 'detail') {
+    if (!curPiece) { go('home'); return null; }
+    const recs     = pieceRecs(curPiece.piece_id);
+    const effStart = effectiveStart(curPiece.start_date, recs);
+    const w        = wks(effStart);
+    const linked   = D_hist.filter(h => h.name.toLowerCase() === curPiece.name.toLowerCase());
+    return shell(<>
+      <Hdr title={'🎵 ' + curPiece.name} onBack={()=>go('home',{htab:'cur'})} />
+      <StatBar cols={[
+        {l:'開始練習', v:effStart, br:true},
+        {l:'已練習',   v:w+'週',  br:true},
+        {l:'次數',     v:recs.length+'次'},
+      ]} />
+      <div style={{flex:1,padding:'0.85rem',overflowY:'auto'}}>
+        <div style={{fontSize:11,color:'#5B8FF9',fontWeight:700,marginBottom:'0.6rem'}}>
+          練習記錄 <span style={{color:'#A8D0F5',fontWeight:400}}>（點每筆可修改 ✎）</span>
+        </div>
+        {recs.length===0 && <div style={{textAlign:'center',color:'#A8D0F5',padding:'2rem',fontSize:13}}>♪ 尚無記錄，快去練習吧！</div>}
+        {recs.map(r => (
+          <EditRecordCard key={r.record_id} rec={r}
+            onSave={ch=>doSaveRecord(curPiece.piece_id,ch)}
+            onDelete={rid=>doDeleteRecord(curPiece.piece_id,rid)} />
+        ))}
+        {linked.length>0 && <>
+          <div style={{fontSize:11,color:'#52C898',fontWeight:700,margin:'1rem 0 0.5rem'}}>🏆 同曲目先前過關記錄</div>
+          {linked.map((h,i) => (
+            <div key={h.piece_id} onClick={()=>go('histdetail',{hsel:h.piece_id,hback:'detail'})}
+              style={{background:'linear-gradient(135deg,#E1F5EE,#D4F5E7)',borderRadius:14,
+                      padding:'0.7rem 0.9rem',marginBottom:'0.4rem',border:'1.5px solid #9FE1CB',
+                      cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}
+              onMouseOver={e=>e.currentTarget.style.boxShadow='0 3px 10px rgba(82,200,152,0.25)'}
+              onMouseOut={e=>e.currentTarget.style.boxShadow='none'}>
+              <div>
+                <div style={{fontSize:13,fontWeight:700,color:'#085041'}}>第 {i+1} 次過關 🎖</div>
+                <div style={{fontSize:11,color:'#52C898',marginTop:2}}>
+                  過關：{fmtDate(h.pass_date)} · 練了 {wks(fmtDate(h.start_date),fmtDate(h.pass_date))} 週 · {(records[h.piece_id]||[]).length} 次
+                </div>
+              </div>
+              <div style={{color:'#52C898',fontSize:16}}>›</div>
+            </div>
+          ))}
+        </>}
+      </div>
+      <div style={{padding:'0.7rem 1rem 1rem',flexShrink:0,display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+        <button onClick={()=>setPassTarget({...curPiece,effStart})}
+          style={{background:'linear-gradient(135deg,#52C898,#0F6E56)',color:'#fff',border:'none',
+                  padding:12,borderRadius:14,fontSize:14,cursor:'pointer',fontWeight:700,
+                  boxShadow:'0 3px 10px rgba(15,110,86,0.35)'}}>🏆 過關</button>
+        <button onClick={()=>go('add',{addFrom:curPiece.piece_id})}
+          style={{background:'#EFF6FF',color:'#2979C9',border:'1.5px solid #A8D0F5',
+                  padding:10,borderRadius:14,fontSize:13,cursor:'pointer',fontWeight:600}}>＋ 新增本曲練習記錄</button>
+      </div>
+    </>);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // HISTDETAIL（已過關 · 唯讀）
+  // ══════════════════════════════════════════════════════════
+  if (sc === 'histdetail') {
+    if (!histPiece) { go('home',{htab:'hist'}); return null; }
+    const recs        = pieceRecs(histPiece.piece_id);
+    const histEffStart = effectiveStart(histPiece.start_date, recs);
+    const w           = wks(histEffStart, fmtDate(histPiece.pass_date));
+    return shell(<>
+      <Hdr title={'🏆 ' + histPiece.name} accent="#0F6E56"
+           onBack={()=>hback==='detail'?go('detail'):go('home',{htab:'hist'})} badge="已過關" />
+      <StatBar bg="#085041" cols={[
+        {l:'開始練習', v:histEffStart, br:true},
+        {l:'過關日期', v:fmtDate(histPiece.pass_date), lc:'#7FE0B8', br:true},
+        {l:'共練習',   v:w+'週', br:true},
+        {l:'次數',     v:recs.length+'次'},
+      ]} />
+      <div style={{flex:1,padding:'0.85rem',overflowY:'auto'}}>
+        <div style={{background:'linear-gradient(135deg,#E1F5EE,#D4F5E7)',border:'1.5px solid #9FE1CB',
+                     borderRadius:12,padding:'0.5rem 0.75rem',marginBottom:'0.7rem',
+                     display:'flex',alignItems:'center',gap:'0.4rem'}}>
+          <span style={{fontSize:14}}>🔒</span>
+          <span style={{fontSize:11,color:'#0F6E56',fontWeight:600}}>已過關記錄為唯讀，無法修改</span>
+        </div>
+        <div style={{fontSize:11,color:'#52C898',fontWeight:700,marginBottom:'0.55rem'}}>練習記錄（{recs.length}次）</div>
+        {recs.length===0 && <div style={{textAlign:'center',color:'#A8D0F5',padding:'2rem',fontSize:13}}>♬ 無記錄</div>}
+        {recs.map(r => <ReadRecordCard key={r.record_id} rec={r} />)}
+      </div>
+    </>);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // ADD
+  // ══════════════════════════════════════════════════════════
+  if (sc === 'add') {
+    // 精簡模式：從本曲 detail 進入
+    if (addFrom) {
+      const piece = D_cur.find(p => p.piece_id === addFrom);
+      if (!piece) { go('home'); return null; }
+      return shell(<>
+        <Hdr title={'🎵 ' + piece.name} sub="新增練習記錄" onBack={()=>go('detail',{sel:addFrom})} />
+        <div style={{flex:1,overflowY:'auto',padding:'0.85rem'}}>
+          <div style={{background:'#fff',borderRadius:18,padding:'1rem',
+                       boxShadow:'0 2px 10px rgba(91,143,249,0.12)',border:'1.5px solid #E8F4FF',
+                       display:'flex',flexDirection:'column',gap:'0.7rem'}}>
+            <div>
+              <div style={{fontSize:11,color:'#5B8FF9',fontWeight:700,marginBottom:4}}>📅 日期</div>
+              <input type="date" value={addDt} onChange={e=>setAddDt(e.target.value)}
+                style={{width:'100%',padding:'9px 10px',borderRadius:10,border:'1.5px solid #A8D0F5',
+                        fontSize:13,background:'#f8fbff',color:'#1a2e4a'}} />
+            </div>
+            <div>
+              <div style={{fontSize:11,color:'#5B8FF9',fontWeight:700,marginBottom:4}}>🎵 練習內容</div>
+              <textarea id="add-single-no" rows={3} value={addNo} onChange={e=>setAddNo(e.target.value)}
+                onFocus={()=>{window._fid='add-single-no';}} placeholder="例：♩=120 合手練習"
+                style={{width:'100%',padding:'9px 10px',borderRadius:10,border:'1.5px solid #A8D0F5',
+                        fontSize:13,background:'#fff',color:'#1a2e4a',resize:'none'}} />
+            </div>
+          </div>
+        </div>
+        <QuickBar />
+        <div style={{padding:'0.6rem 0.85rem 0.9rem',flexShrink:0}}>
+          <button onClick={doSaveSingle}
+            style={{width:'100%',background:'linear-gradient(135deg,#5B8FF9,#2979C9)',color:'#fff',
+                    border:'none',padding:12,borderRadius:14,fontSize:13,cursor:'pointer',fontWeight:700,
+                    boxShadow:'0 3px 10px rgba(41,121,201,0.35)'}}>✓ 儲存記錄</button>
+        </div>
+      </>);
+    }
+
+    // 完整模式：從首頁進入
+    function updateRow(i, field, val) {
+      setRows(prev => { const nd=[...prev]; nd[i]={...nd[i],[field]:val}; return nd; });
+    }
+    return shell(<>
+      <Hdr title="🎵 新增練習記錄" onBack={()=>go('home')} />
+      <div style={{flex:1,overflowY:'auto',padding:'0.85rem',display:'flex',flexDirection:'column',gap:'0.7rem'}}>
+
+        <div style={{background:'#fff',borderRadius:18,padding:'1rem',
+                     boxShadow:'0 2px 10px rgba(91,143,249,0.1)',border:'1.5px solid #E8F4FF'}}>
+          <div style={{fontSize:12,color:'#5B8FF9',fontWeight:700,marginBottom:'0.55rem'}}>✏️ 手動新增（可多筆）</div>
+          <div style={{marginBottom:'0.6rem'}}>
+            <div style={{fontSize:11,color:'#5B8FF9',fontWeight:600,marginBottom:4}}>📅 日期（所有筆共用）</div>
+            <input type="date" value={multDt} onChange={e=>setMultDt(e.target.value)}
+              style={{width:'100%',padding:'9px 10px',borderRadius:10,border:'1.5px solid #A8D0F5',
+                      fontSize:13,background:'#f8fbff',color:'#1a2e4a'}} />
+          </div>
+          {rows.map((row, i) => (
+            <div key={row.id} style={{background:'linear-gradient(135deg,#F7FBFF,#EFF6FF)',borderRadius:14,
+                                      padding:'0.7rem',marginBottom:'0.5rem',border:'1.5px solid #D6EAFF'}}>
+              <div style={{display:'flex',alignItems:'center',gap:'0.4rem',marginBottom:'0.4rem'}}>
+                <div style={{width:22,height:22,borderRadius:'50%',
+                             background:'linear-gradient(135deg,#5B8FF9,#2979C9)',
+                             display:'flex',alignItems:'center',justifyContent:'center',
+                             fontSize:11,color:'#fff',flexShrink:0,fontWeight:700}}>{i+1}</div>
+                <input value={row.piece} onChange={e=>updateRow(i,'piece',e.target.value)}
+                  id={'pc-'+row.id} placeholder="曲目名稱"
+                  onFocus={()=>{window._fid='pc-'+row.id;}}
+                  style={{flex:1,padding:'7px 9px',borderRadius:9,border:'1.5px solid #A8D0F5',
+                          fontSize:13,background:'#fff',color:'#1a2e4a'}} />
+                {rows.length>1 && (
+                  <button onMouseDown={e=>e.preventDefault()} onClick={()=>setRows(prev=>prev.filter((_,j)=>j!==i))}
+                    style={{background:'#FFEBEB',border:'1.5px solid #F5B8B8',color:'#C0392B',
+                            width:26,height:26,borderRadius:'50%',fontSize:13,cursor:'pointer',
+                            flexShrink:0,lineHeight:1,fontWeight:700}}>×</button>
+                )}
+              </div>
+              <textarea value={row.notes} onChange={e=>updateRow(i,'notes',e.target.value)}
+                id={'nt-'+row.id} rows={2} placeholder="練習內容（先點此欄，再用快速按鈕）"
+                onFocus={()=>{window._fid='nt-'+row.id;}}
+                style={{width:'100%',padding:'7px 9px',borderRadius:9,border:'1.5px solid #A8D0F5',
+                        fontSize:13,background:'#fff',color:'#1a2e4a',resize:'none'}} />
+            </div>
+          ))}
+          <button onClick={()=>setRows(prev=>[...prev,{id:Date.now(),piece:'',notes:''}])}
+            style={{width:'100%',background:'#EFF6FF',border:'2px dashed #A8D0F5',
+                    color:'#5B8FF9',padding:'8px',borderRadius:12,fontSize:12,cursor:'pointer',fontWeight:600}}>
+            ＋ 加一筆曲目
+          </button>
+        </div>
+      </div>
+      <QuickBar />
+      <div style={{padding:'0.6rem 0.85rem 0.9rem',flexShrink:0}}>
+        <button onClick={doSaveAll}
+          style={{width:'100%',background:'linear-gradient(135deg,#5B8FF9,#2979C9)',color:'#fff',
+                  border:'none',padding:12,borderRadius:14,fontSize:13,cursor:'pointer',fontWeight:700,
+                  boxShadow:'0 3px 10px rgba(41,121,201,0.35)'}}>✓ 儲存所有記錄</button>
+      </div>
+    </>);
+  }
+
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById('app')).render(<App />);
+</script>
+</body>
+</html>
