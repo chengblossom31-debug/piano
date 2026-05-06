@@ -37,8 +37,8 @@
 // 設定（GitHub Actions 部署時自動替換佔位符）
 // ══════════════════════════════════════════════════════════════
 // Supabase — 資料存取（anon key 設計上可放前端，搭配 RLS 保護）
-const SUPABASE_URL      = "https://wzsjuxhmurifjyswvyaw.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6c2p1eGhtdXJpZmp5c3d2eWF3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU3OTQ1MzUsImV4cCI6MjA5MTM3MDUzNX0.QJWdL8HJEBRK5YJYU8klFiHTnIeQRQFYAcETEhS-MVM";
+const SUPABASE_URL      = "%%SUPABASE_URL%%";
+const SUPABASE_ANON_KEY = "%%SUPABASE_ANON_KEY%%";
 </script>
 
 <script type="text/babel">
@@ -337,6 +337,7 @@ function App() {
   const [htab,           setHtab]           = useState('cur');
   const [hsearch,        setHsearch]        = useState('');
   const [passTarget,     setPassTarget]     = useState(null);
+  const [editingPiece,   setEditingPiece]   = useState(null);  // { piece_id, name }
   const [toast,          setToast]          = useState({ msg:'', type:'info' });
   const [busy,           setBusy]           = useState(false);
   const [editingProfile, setEditingProfile] = useState(null);
@@ -454,6 +455,36 @@ function App() {
       setPassTarget(null);
       go('home', { htab:'hist' });
       showToast('🏆 ' + piece.name + ' 過關！');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  async function doRenamePiece(piece_id, newName) {
+    if (!newName.trim()) return;
+    setBusy(true);
+    try {
+      await sb('PATCH', 'pieces', {
+        eq:   { piece_id },
+        body: { name: newName.trim() },
+      });
+      setPieces(prev => prev.map(p =>
+        p.piece_id === piece_id ? { ...p, name: newName.trim() } : p
+      ));
+      setEditingPiece(null);
+      showToast('✓ 曲目名稱已更新');
+    } catch (err) { showToast(err.message, 'error'); }
+    setBusy(false);
+  }
+
+  async function doDeletePiece(piece_id, pieceName) {
+    if (!confirm(`確定要刪除「${pieceName}」及所有練習記錄？`)) return;
+    setBusy(true);
+    try {
+      await sb('DELETE', 'pieces', { eq: { piece_id } });
+      setPieces(prev => prev.filter(p => p.piece_id !== piece_id));
+      setRecords(prev => { const nd = { ...prev }; delete nd[piece_id]; return nd; });
+      showToast('已刪除');
+      go('home', { htab: 'cur' });
     } catch (err) { showToast(err.message, 'error'); }
     setBusy(false);
   }
@@ -797,8 +828,65 @@ function App() {
     const effStart = effectiveStart(curPiece.start_date, recs);
     const w        = wks(effStart);
     const linked   = D_hist.filter(h => h.name.toLowerCase() === curPiece.name.toLowerCase());
+
+    // ── 修改曲目名稱 inline modal ──────────────────────────
+    function PieceEditModal() {
+      const [name, setName] = React.useState(curPiece.name);
+      return (
+        <div style={{position:'fixed',inset:0,background:'rgba(4,44,83,0.6)',display:'flex',
+                     alignItems:'center',justifyContent:'center',zIndex:999,padding:'1.5rem'}}>
+          <div style={{background:'#fff',borderRadius:20,width:'100%',maxWidth:340,
+                       overflow:'hidden',boxShadow:'0 8px 32px rgba(4,44,83,0.3)'}}>
+            <div style={{background:'linear-gradient(135deg,#0C447C,#185FA5)',padding:'1rem 1.2rem'}}>
+              <div style={{color:'#fff',fontSize:15,fontWeight:700}}>✏️ 修改曲目名稱</div>
+            </div>
+            <div style={{padding:'1.2rem',display:'flex',flexDirection:'column',gap:'0.8rem'}}>
+              <input value={name} onChange={e=>setName(e.target.value)}
+                autoFocus
+                style={{width:'100%',padding:'10px 12px',borderRadius:10,border:'1.5px solid #A8D0F5',
+                        fontSize:14,color:'#1a2e4a',boxSizing:'border-box'}}/>
+              <div style={{display:'flex',gap:'0.5rem'}}>
+                <button onClick={()=>setEditingPiece(null)}
+                  style={{flex:1,background:'#F0F7FF',color:'#5B8FF9',border:'1.5px solid #A8D0F5',
+                          padding:'10px',borderRadius:10,fontSize:13,cursor:'pointer',fontWeight:600}}>
+                  取消
+                </button>
+                <button onClick={()=>doRenamePiece(curPiece.piece_id, name)}
+                  style={{flex:2,background:'linear-gradient(135deg,#5B8FF9,#2979C9)',color:'#fff',
+                          border:'none',padding:'10px',borderRadius:10,fontSize:13,
+                          cursor:'pointer',fontWeight:700}}>
+                  ✓ 儲存
+                </button>
+              </div>
+              <button onClick={()=>doDeletePiece(curPiece.piece_id, curPiece.name)}
+                style={{width:'100%',background:'#FFF0F0',color:'#C0392B',border:'1.5px solid #F5B8B8',
+                        padding:'9px',borderRadius:10,fontSize:13,cursor:'pointer',fontWeight:600}}>
+                🗑 刪除此曲目
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return shell(<>
-      <Hdr title={'🎵 ' + curPiece.name} onBack={()=>go('home',{htab:'cur'})} />
+      {editingPiece && <PieceEditModal />}
+      <div style={{background:'linear-gradient(135deg,#0C447C,#185FA5)',padding:'0.9rem 1.1rem',
+                   display:'flex',alignItems:'center',gap:'0.5rem',flexShrink:0,
+                   boxShadow:'0 2px 8px rgba(12,68,124,0.25)'}}>
+        <button onClick={()=>go('home',{htab:'cur'})}
+          style={{background:'rgba(255,255,255,0.2)',border:'none',color:'#fff',fontSize:18,
+                  cursor:'pointer',padding:'4px 8px',lineHeight:1,borderRadius:10}}>←</button>
+        <div style={{flex:1,minWidth:0,color:'#fff',fontSize:15,fontWeight:700,
+                     whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+          🎵 {curPiece.name}
+        </div>
+        <button onClick={()=>setEditingPiece(curPiece)}
+          style={{background:'rgba(255,255,255,0.2)',border:'none',color:'#fff',fontSize:14,
+                  cursor:'pointer',padding:'5px 10px',lineHeight:1,borderRadius:10,flexShrink:0}}>
+          ✎
+        </button>
+      </div>
       <StatBar cols={[
         {l:'開始練習', v:effStart, br:true},
         {l:'已練習',   v:w+'週',  br:true},
