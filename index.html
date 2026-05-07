@@ -383,19 +383,17 @@ function App() {
   }
 
   // ── 初始載入 ──────────────────────────────────────────────
-  useEffect(() => {
-    sb('GET', 'profiles', { order: 'created_at.asc' })
-      .then(data => {
-        setProfiles(data || []);
-        const ld = document.getElementById('loading');
-        if (ld) ld.style.display = 'none';
-      })
-      .catch(err => {
-        showToast('載入失敗：' + err.message, 'error');
-        const ld = document.getElementById('loading');
-        if (ld) ld.style.display = 'none';
-      });
-  }, []);
+ useEffect(() => {
+  if (!pid) return;
+  const load = () => sb('GET', 'pieces', { eq:{ profile_id: pid }, order:'created_at.asc' })
+    .then(setPieces).catch(err => showToast(err.message, 'error'));
+
+  if (_authToken) {
+    load();
+  } else {
+    autoSignIn().then(load);
+  }
+}, [pid]);
 
   // ── 切換帳號時載入曲目 ────────────────────────────────────
 useEffect(() => {
