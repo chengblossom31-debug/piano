@@ -29,10 +29,14 @@ jobs:
         env:
           SUPABASE_URL:      ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          FAMILY_EMAIL:      ${{ secrets.FAMILY_EMAIL }}
+          FAMILY_PASSWORD:   ${{ secrets.FAMILY_PASSWORD }}
         run: |
           sed -i \
             -e "s|%%SUPABASE_URL%%|${SUPABASE_URL}|g" \
             -e "s|%%SUPABASE_ANON_KEY%%|${SUPABASE_ANON_KEY}|g" \
+            -e "s|%%FAMILY_EMAIL%%|${FAMILY_EMAIL}|g" \
+            -e "s|%%FAMILY_PASSWORD%%|${FAMILY_PASSWORD}|g" \
             index.html
           echo "✅ Secrets injected"
 
