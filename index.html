@@ -37,8 +37,11 @@
 // 設定（GitHub Actions 部署時自動替換佔位符）
 // ══════════════════════════════════════════════════════════════
 // Supabase — 資料存取（anon key 設計上可放前端，搭配 RLS 保護）
-const SUPABASE_URL      = "https://wzsjuxhmurifjyswvyaw.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6c2p1eGhtdXJpZmp5c3d2eWF3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU3OTQ1MzUsImV4cCI6MjA5MTM3MDUzNX0.QJWdL8HJEBRK5YJYU8klFiHTnIeQRQFYAcETEhS-MVM";
+const SUPABASE_URL      = "%%SUPABASE_URL%%";
+const SUPABASE_ANON_KEY = "%%SUPABASE_ANON_KEY%%";
+// ✅ 新增這兩行
+const FAMILY_EMAIL    = "%%FAMILY_EMAIL%%";
+const FAMILY_PASSWORD = "%%FAMILY_PASSWORD%%";
 </script>
 
 <script type="text/babel">
@@ -70,7 +73,7 @@ async function sb(method, table, opts = {}) {
 
   const headers = {
     apikey:        SUPABASE_ANON_KEY,
-    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+    Authorization: `Bearer ${_authToken || SUPABASE_ANON_KEY}`,
     'Content-Type': 'application/json',
   };
   // return=representation → POST/PATCH 回傳操作後的資料
@@ -95,6 +98,29 @@ async function sb(method, table, opts = {}) {
   return single ? (Array.isArray(data) ? data[0] || null : data) : data;
 }
 
+ // ── Auth Token（登入後取得，取代 anon key 做授權）──────────────
+let _authToken = null;
+
+async function autoSignIn() {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+      },
+      body: JSON.stringify({ email: FAMILY_EMAIL, password: FAMILY_PASSWORD }),
+    });
+    const data = await res.json();
+    if (data.access_token) {
+      _authToken = data.access_token;
+    } else {
+      console.error('Auto sign-in failed:', data);
+    }
+  } catch (err) {
+    console.error('Auto sign-in error:', err);
+  }
+}
 
 
 // ── 工具函式 ──────────────────────────────────────────────────
@@ -371,19 +397,22 @@ function App() {
   }, []);
 
   // ── 切換帳號時載入曲目 ────────────────────────────────────
-  useEffect(() => {
-    if (!pid) return;
-    sb('GET', 'pieces', { eq:{ profile_id: pid }, order:'created_at.asc' })
-      .then(setPieces).catch(err => showToast(err.message, 'error'));
-  }, [pid]);
-
-  async function loadRecords(piece_id) {
-    if (records[piece_id]) return;
-    try {
-      const recs = await sb('GET', 'records', { eq:{ piece_id }, order:'date.desc' });
-      setRecords(prev => ({ ...prev, [piece_id]: recs || [] }));
-    } catch (err) { showToast(err.message, 'error'); }
-  }
+useEffect(() => {
+  autoSignIn().then(() => {
+    sb('GET', 'profiles', { order: 'created_at.asc' })
+      .then(data => {
+        setProfiles(data || []);
+        const ld = document.getElementById('loading');
+        if (ld) ld.style.display = 'none';
+      })
+      .catch(err => {
+        showToast('載入失敗：' + err.message, 'error');
+        const ld = document.getElementById('loading');
+        if (ld) ld.style.display = 'none';
+      });
+  });
+}, []);
+ 
 
   function go(screen, opts = {}) {
     if (opts.pid    !== undefined) setPid(opts.pid);
