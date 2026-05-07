@@ -47,6 +47,31 @@ const FAMILY_PASSWORD = "%%FAMILY_PASSWORD%%";
 <script type="text/babel">
 const { useState, useEffect, useRef } = React;
 
+ // ── Auth Token（登入後取得，取代 anon key 做授權）──────────────
+let _authToken = null;
+
+async function autoSignIn() {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+      },
+      body: JSON.stringify({ email: FAMILY_EMAIL, password: FAMILY_PASSWORD }),
+    });
+    const data = await res.json();
+    if (data.access_token) {
+      _authToken = data.access_token;
+    } else {
+      console.error('Auto sign-in failed:', data);
+    }
+  } catch (err) {
+    console.error('Auto sign-in error:', err);
+  }
+}
+ 
+
 // ══════════════════════════════════════════════════════════════
 // Supabase REST API 輔助函式
 // ══════════════════════════════════════════════════════════════
@@ -96,30 +121,6 @@ async function sb(method, table, opts = {}) {
   if (!text) return single ? null : [];
   const data = JSON.parse(text);
   return single ? (Array.isArray(data) ? data[0] || null : data) : data;
-}
-
- // ── Auth Token（登入後取得，取代 anon key 做授權）──────────────
-let _authToken = null;
-
-async function autoSignIn() {
-  try {
-    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': SUPABASE_ANON_KEY,
-      },
-      body: JSON.stringify({ email: FAMILY_EMAIL, password: FAMILY_PASSWORD }),
-    });
-    const data = await res.json();
-    if (data.access_token) {
-      _authToken = data.access_token;
-    } else {
-      console.error('Auto sign-in failed:', data);
-    }
-  } catch (err) {
-    console.error('Auto sign-in error:', err);
-  }
 }
 
 
